@@ -1,14 +1,10 @@
 import uuid
 import datetime
 import requests
-import json
 import logging
 
 import streamlit as st
 from streamlit import session_state as ss
-import streamlit_authenticator as stauth
-import yaml
-from yaml.loader import SafeLoader
 from dotenv import load_dotenv
 import os
 
@@ -30,6 +26,7 @@ if "chats" not in ss:
             "pdf_id": "1",
             "pdf_name": "nvidia.pdf",
             "summary_generated": True,
+            "model": "gemini/gemini-2.0-flash",
         }
     }
 
@@ -109,6 +106,7 @@ def create_new_chat():
         "created_at": timestamp,
         "has_pdf": False,  # Track if PDF is uploaded
         "summary_generated": False,  # Track if summary has been generated
+        "model": "gemini/gemini-2.0-flash",
     }
     logger.info(f"Created new chat: {ss.chats[chat_id]}")
     ss.current_chat_id = chat_id
@@ -176,7 +174,6 @@ def send_message():
                     "pdf_id": "0000",
                     "question": user_message,
                     "max_tokens": 500,  # You can adjust this value
-                    "model": "gemini/gemini-2.0-flash",
                 },
                 params=params_payload,
             )
@@ -185,10 +182,11 @@ def send_message():
             # Send question to backend with PDF ID
             response = requests.post(
                 f"{host}/ask_question",
-                json={
+                params={
                     "pdf_id": pdf_id,
                     "question": user_message,
                     "max_tokens": 500,  # You can adjust this value
+                    "model": ss.chats[chat_id]["model"],
                 },
             )
 
@@ -273,10 +271,11 @@ def generate_summary(chat_id):
     try:
         response = requests.post(
             f"{host}/ask_question",
-            json={
+            params={
                 "pdf_id": pdf_id,
                 "question": "Summarize the document",
                 "max_tokens": 500,  # You can adjust this value
+                "model": ss.chats[chat_id]["model"],
             },
         )
         logger.info(f"Summary response: {response.json()}")
@@ -414,6 +413,7 @@ with middle_col:
                                 state="error",
                             )
                             ss.chats[chat_id]["has_pdf"] = False
+                        st.rerun()
             else:
 
                 st.info(
@@ -435,6 +435,18 @@ with middle_col:
                     disabled=chat.get("summary_generated", False),
                 ):
                     generate_summary(chat_id)
+                    st.rerun()
+                ss.chats[chat_id]["model"] = st.selectbox(
+                    "Select model",
+                    options=[
+                        "gemini/gemini-2.0-flash",
+                        "openai/gpt-4o-mini",
+                        "xai/grok-2-latest",
+                        "deepseek/deepseek-chat",
+                        "anthropic/claude-3-5-sonnet-20240620",
+                    ],
+                    index=0,
+                )
                 if ss.current_chat_id == "1":
                     hybrid_search = st.checkbox("Hybrid Search")
                     if hybrid_search:
