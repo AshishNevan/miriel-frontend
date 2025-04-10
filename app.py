@@ -1,342 +1,483 @@
-import base64
+import uuid
+import datetime
+import requests
+import logging
+
+import streamlit as st
+from streamlit import session_state as ss
+from dotenv import load_dotenv
 import os
 
-from dotenv import load_dotenv
-import requests
-import streamlit as st
-
 load_dotenv()
-FASTAPI_URL = os.getenv("FASTAPI_URL")
+st.set_page_config(page_title="Miriel", page_icon="💬", layout="wide")
 
-# Initialize session state variables
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "research_document" not in st.session_state:
-    st.session_state.research_document = None
-if "active_agents" not in st.session_state:
-    st.session_state.active_agents = {
-        "snowflake_agent": False,
-        "rag_agent": False,
-        "web_search_agent": False,
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+host = os.getenv("HOST")
+
+if "chats" not in ss:
+    ss.chats = {
+        "1": {
+            "id": "1",
+            "name": "nvidia",
+            "created_at": "2025-03-22 12:00:00",
+            "has_pdf": True,
+            "pdf_id": "1",
+            "pdf_name": "nvidia.pdf",
+            "summary_generated": True,
+            "model": "gemini/gemini-2.0-flash",
+        }
     }
 
-st.set_page_config(page_title="LangGraph NVIDIA Research Agent", layout="wide")
+if "messages" not in ss:
+    ss.messages = {
+        "1": [
+            {
+                "role": "system",
+                "content": "Ask me any question about nvidia financial data",
+            }
+        ]
+    }
 
-# Sidebar
-with st.sidebar:
-    st.title("LangGraph NVIDIA Research Agent")
-    st.markdown(
-        "This assistant uses multiple agents to generate research documents based on NVIDIA data:"
-    )
-    st.markdown(
-        "- **Snowflake Agent**: Analyzes NVIDIA valuation measures, generates summary and visualization charts"
-    )
-    st.markdown(
-        "- **RAG Agent**: Processes NVIDIA 10-K/10-Q reports (2022-2025) with hybrid search using Pinecone"
-    )
-    st.markdown("- **Web Search Agent**: Retrieves real-time data from web")
+if "current_chat_id" not in ss:
+    ss.current_chat_id = None
 
-    st.subheader("Select Active Agents")
+if "new_chat_name" not in ss:
+    ss.new_chat_name = ""
 
-    st.session_state.active_agents["snowflake_agent"] = st.checkbox(
-        "Snowflake Agent (Valuation Measures)",
-        value=st.session_state.active_agents["snowflake_agent"],
-        help="Analyzes NVIDIA valuation measures, generates summary and visualization charts using Snowflake database",
-    )
+if "input_tokens" not in ss:
+    ss.input_tokens = 0
 
-    st.session_state.active_agents["rag_agent"] = st.checkbox(
-        "RAG Agent (10-K/Q Reports)",
-        value=st.session_state.active_agents["rag_agent"],
-        help="Processes NVIDIA 10-K/Q reports from 2022-2025",
-    )
+if "output_tokens" not in ss:
+    ss.output_tokens = 0
 
-    st.session_state.active_agents["web_search_agent"] = st.checkbox(
-        "Web Search Agent (Tavily)",
-        value=st.session_state.active_agents["web_search_agent"],
-        help="Retrieves latest information from the web using Tavily",
-    )
+if "cost" not in ss:
+    ss.cost = 0
 
-    # Add year/quarter filters
-    st.subheader("Report Filters")
-    if "year" not in st.session_state:
-        st.session_state.year = ""
-    if "quarter" not in st.session_state:
-        st.session_state.quarter = ""
+if "year" not in ss:
+    ss.year = None
 
-    st.session_state.year = st.selectbox(
-        "Fiscal Year", options=["None", "2022", "2023", "2024", "2025"], index=1
-    )
-    if st.session_state.year == "None":
-        st.session_state.quarter = st.selectbox(
-            "Fiscal Quarter",
-            options=["None", "1", "2", "3", "4"],
-            index=0,
-            disabled=True,
+if "quarter" not in ss:
+    ss.quarter = None
+
+
+def upload_pdf_to_backend(file, chat_id, ocr_method: str):
+    try:
+        logger.info(f"Uploading PDF to backend with OCR method: {ocr_method}")
+        response = requests.post(
+            f"{host}/upload_pdf",
+            files={"file": (file.name, file, "application/pdf")},
+            params={
+                "parser": ocr_method,
+                "chunking_strategy": chunking_strategy,
+                "vector_store": vector_store,
+            },
         )
-    else:
-        st.session_state.quarter = st.selectbox(
-            "Fiscal Quarter",
-            options=["None", "1", "2", "3", "4"],
-            index=0,
+        if response.status_code == 201:
+            response_data = response.json()
+            # Store the PDF ID and update chat status
+            ss.chats[chat_id].update(
+                {
+                    "pdf_id": response_data["pdf_id"],
+                    "has_pdf": True,
+                    "pdf_name": file.name,
+                }
+            )
+            logger.info(f"PDF uploaded to backend: {response_data['pdf_id']}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error uploading PDF to backend: {str(e)}")
+        st.error("Error uploading PDF to backend")
+        return False
+
+
+def create_new_chat():
+    if not ss.new_chat_name:
+        return
+
+    chat_id = str(uuid.uuid4())
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    ss.chats[chat_id] = {
+        "id": chat_id,
+        "name": ss.new_chat_name,
+        "created_at": timestamp,
+        "has_pdf": False,  # Track if PDF is uploaded
+        "summary_generated": False,  # Track if summary has been generated
+        "model": "gemini/gemini-2.0-flash",
+    }
+    logger.info(f"Created new chat: {ss.chats[chat_id]}")
+    ss.current_chat_id = chat_id
+    ss.messages[chat_id] = []
+    ss.messages[chat_id].append(
+        {
+            "role": "system",
+            "content": "Please upload a PDF document to begin the conversation.",
+        }
+    )
+
+    # Clear the input field
+    ss.new_chat_name = ""
+
+
+def select_chat(chat_id):
+    ss.current_chat_id = chat_id
+
+
+def send_message():
+    if not ss.user_input or not ss.current_chat_id:
+        return
+
+    if len(ss.user_input) < 10:
+        ss.messages[ss.current_chat_id].extend(
+            [
+                {"role": "user", "content": ss.user_input},
+                {
+                    "role": "system",
+                    "content": "Please enter a message longer than 10 characters.",
+                },
+            ]
+        )
+        return
+
+    chat_id = ss.current_chat_id
+    user_message = ss.user_input
+    pdf_id = ss.chats[chat_id].get("pdf_id")
+    logger.info(
+        f"Creating new message for chat with id: {chat_id}, user message: {user_message}, pdf_id: {pdf_id}"
+    )
+    # if not pdf_id:
+    #     logger.error("No PDF associated with this chat. Please upload a PDF first.")
+    #     st.error("No PDF associated with this chat. Please upload a PDF first.")
+    #     return
+
+    # Add user message to chat
+    ss.messages[chat_id].append({"role": "user", "content": user_message})
+
+    try:
+        response = {}
+        if chat_id == "1":
+            params_payload = (
+                {
+                    "year": ss["year"],
+                    "quarter": ss["quarter"],
+                }
+                if hybrid_search
+                else {}
+            )
+            print(params_payload)
+            response = requests.post(
+                f"{host}/ask_nvidia",
+                json={
+                    "pdf_id": "0000",
+                    "question": user_message,
+                    "max_tokens": 500,  # You can adjust this value
+                },
+                params=params_payload,
+            )
+
+        else:
+            # Send question to backend with PDF ID
+            response = requests.post(
+                f"{host}/ask_question",
+                params={
+                    "pdf_id": pdf_id,
+                    "question": user_message,
+                    "max_tokens": 500,  # You can adjust this value
+                    "model": ss.chats[chat_id]["model"],
+                },
+            )
+
+        if response.status_code == 200:
+            response_data = response.json()
+            answer = response_data.get(
+                "answer", "Sorry, I couldn't process your question."
+            )
+
+            # Display token usage and cost metrics
+            usage_metrics = response_data.get("usage_metrics", {})
+            if usage_metrics:
+                ss.input_tokens += usage_metrics.get("input_tokens", 0)
+                ss.output_tokens += usage_metrics.get("output_tokens", 0)
+                ss.cost += usage_metrics.get("cost", 0)
+            ss["messages"][chat_id].append({"role": "assistant", "content": answer})
+            logger.info(f"Answer received from backend: {answer}")
+        else:
+
+            ss["messages"][chat_id].append(
+                {
+                    "role": "assistant",
+                    "content": "Sorry, I encountered an error processing your question.",
+                }
+            )
+            logger.error(
+                f"Error processing your question: {response.status_code}, {response.text}"
+            )
+    except Exception as e:
+        logger.error(f"Error processing your question: {str(e)}")
+        ss.messages[chat_id].append(
+            {
+                "role": "assistant",
+                "content": f"Error processing your question: {str(e)}",
+            }
         )
 
-    if st.button("Clear Conversation"):
-        st.session_state.messages = []
-        st.session_state.research_document = None
-        st.rerun()
 
-# Main chat interface
-st.title("LangGraph NVIDIA Research Assistant")
+def insert_column_data(data_item):
+    if not ss.current_chat_id:
+        return
 
+    chat_id = ss.current_chat_id
 
-# Function to create a download link for the markdown file
-def get_download_link(file_content, file_name):
-    """
-    Generates a link allowing the user to download a file from the app.
-    :param file_content: The content of the file to download.
-    :param file_name: The name of the file to download.
-    :return: A link to download the file.
-    """
-    b64 = base64.b64encode(file_content.encode()).decode()
-    href = f'<a href="data:file/markdown;base64,{b64}" download="{file_name}">Download {file_name}</a>'
-    return href
+    ss.messages[chat_id].append(
+        {"role": "user", "content": f"Tell me about: {data_item}"}
+    )
+
+    bot_response = (
+        f"Here's information about {data_item}. This is a placeholder response."
+    )
+    ss.messages[chat_id].append({"role": "assistant", "content": bot_response})
 
 
-# --- Chat Interface ---
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        if (
-            message["role"] == "assistant"
-            and "is_markdown" in message
-            and message["is_markdown"]
-        ):
-            st.markdown(message["content"])
-            if "visualization" in message:
-                st.image(
-                    base64.b64decode(message["visualization"]), use_column_width=True
+def delete_chat(chat_id):
+    logger.info(f"Deleting chat with id: {chat_id}")
+    if chat_id in ss.chats:
+        del ss.chats[chat_id]
+    if chat_id in ss.messages:
+        del ss.messages[chat_id]
+    if ss.current_chat_id == chat_id:
+        ss.current_chat_id = None
+    st.rerun()
+
+
+def clear_all_data():
+    logger.info("Clearing all chat data")
+    ss.chats = {}
+    ss.messages = {}
+    ss.current_chat_id = None
+    st.rerun()
+
+
+def generate_summary(chat_id):
+    pdf_id = ss.chats[chat_id].get("pdf_id")
+
+    if not pdf_id:
+        logger.error("No PDF associated with this chat. Please upload a PDF first.")
+        st.error("No PDF associated with this chat. Please upload a PDF first.")
+        return
+
+    try:
+        response = requests.post(
+            f"{host}/ask_question",
+            params={
+                "pdf_id": pdf_id,
+                "question": "Summarize the document",
+                "max_tokens": 500,  # You can adjust this value
+                "model": ss.chats[chat_id]["model"],
+            },
+        )
+        logger.info(f"Summary response: {response.json()}")
+        if response.status_code == 200:
+            response_data = response.json()
+            summary = response_data.get(
+                "answer", "Sorry, I couldn't process your question."
+            )
+
+            ss.messages[chat_id].append(
+                {
+                    "role": "assistant",
+                    "content": f"Here's a summary of the document:\n\n{summary}",
+                }
+            )
+            logger.info(f"Summary generated: {summary}")
+            usage_metrics = response_data.get("usage_metrics", {})
+            if usage_metrics:
+                ss.input_tokens += usage_metrics.get("input_tokens", 0)
+                ss.output_tokens += usage_metrics.get("output_tokens", 0)
+                ss.cost += usage_metrics.get("cost", 0)
+            # Mark summary as generated
+            st.session_state.chats[chat_id]["summary_generated"] = True
+        else:
+            ss.messages[chat_id].append(
+                {
+                    "role": "assistant",
+                    "content": "Sorry, I encountered an error generating the summary.",
+                }
+            )
+            logger.error(
+                f"Error generating summary: {response.status_code}, {response.text}"
+            )
+    except Exception as e:
+        ss.messages[chat_id].append(
+            {
+                "role": "assistant",
+                "content": f"Error generating summary: {str(e)}",
+            }
+        )
+        logger.error(f"Error generating summary: {str(e)}")
+
+
+left_col, middle_col, right_col = st.columns([20, 60, 20])
+
+with left_col:
+    st.header("Create New Chat")
+
+    st.text_input(
+        "Chat Name",
+        key="new_chat_name",
+        on_change=create_new_chat,
+    )
+
+    st.divider()
+    st.subheader("Your Chats")
+
+    if not ss.chats:
+        st.info("No chats yet. Create a new chat to get started!")
+
+    for chat_id, chat in ss.chats.items():
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if st.button(
+                f"{chat['name']}",
+                key=f"chat_{chat_id}",
+                use_container_width=True,
+            ):
+                select_chat(chat_id)
+        with col2:
+            if st.button("🗑️", key=f"delete_{chat_id}"):
+                delete_chat(chat_id)
+
+    if ss.chats:
+        st.divider()
+        if st.button("Clear All Chats", type="secondary"):
+            clear_all_data()
+
+with middle_col:
+    st.header("Chat")
+
+    chat_container = st.container(height=500, border=True)
+
+    with chat_container:
+        if ss.current_chat_id:
+            chat_id = ss.current_chat_id
+            chat = ss.chats[chat_id]
+            user_input = ss["user_input"] = ""
+
+            st.subheader(f"Chat: {chat['name']}")
+
+            # Show PDF upload prompt if no PDF is uploaded yet
+            if not chat.get("has_pdf", False):
+                with st.status("Upload a PDF document", expanded=True) as upload_status:
+                    ocr_method = st.selectbox(
+                        "Select parsing method",
+                        options=["mistral", "docling"],
+                        index=0,
+                    )
+                    logger.info(f"Selected OCR method: {ocr_method}")
+                    chunking_strategy = st.selectbox(
+                        "Select chunking strategy",
+                        options=["recursive", "kamradt", "fixed"],
+                        index=0,
+                    )
+                    logger.info(f"Selected chunking strategy: {chunking_strategy}")
+                    vector_store = st.selectbox(
+                        "Select vector store",
+                        options=["pinecone", "chroma", "naive"],
+                        index=1,
+                    )
+                    logger.info(f"Selected vector store: {vector_store}")
+
+                    uploaded_file = st.file_uploader(
+                        "Upload a PDF document",
+                        type=["pdf"],
+                    )
+                    if uploaded_file is not None:
+                        if upload_pdf_to_backend(uploaded_file, chat_id, ocr_method):
+                            ss.messages[chat_id].append(
+                                {
+                                    "role": "system",
+                                    "content": f"PDF '{uploaded_file.name}' has been uploaded and processed. You can now ask questions about the document.",
+                                }
+                            )
+                            upload_status.update(
+                                label="PDF uploaded successfully!",
+                                state="complete",
+                                expanded=False,
+                            )
+                            ss.chats[chat_id]["has_pdf"] = True
+                        else:
+                            upload_status.update(
+                                label="Failed to upload PDF",
+                                state="error",
+                            )
+                            ss.chats[chat_id]["has_pdf"] = False
+                        st.rerun()
+            else:
+
+                st.info(
+                    f"📄 Current PDF: {chat.get('pdf_name')} (ID: {chat.get('pdf_id')})"
+                )
+
+                # Show messages
+                for message in ss.messages.get(ss.current_chat_id, []):
+                    if message["role"] == "user":
+                        st.chat_message("user").write(message["content"])
+                    elif message["role"] == "system":
+                        st.chat_message("system").write(message["content"])
+                    else:
+                        st.chat_message("assistant").write(message["content"])
+
+                if st.button(
+                    "Summarize Document",
+                    type="primary",
+                    disabled=chat.get("summary_generated", False),
+                ):
+                    generate_summary(chat_id)
+                    st.rerun()
+                ss.chats[chat_id]["model"] = st.selectbox(
+                    "Select model",
+                    options=[
+                        "gemini/gemini-2.0-flash",
+                        "openai/gpt-4o-mini",
+                        "xai/grok-2-latest",
+                        "deepseek/deepseek-chat",
+                        "anthropic/claude-3-5-sonnet-20240620",
+                    ],
+                    index=0,
+                )
+                if ss.current_chat_id == "1":
+                    hybrid_search = st.checkbox("Hybrid Search")
+                    if hybrid_search:
+                        year = st.slider(
+                            "Year",
+                            min_value=2022,
+                            max_value=2025,
+                            value=2025,
+                            step=1,
+                            key="year",
+                        )
+                        quarter = st.selectbox(
+                            "Quarter",
+                            options=["Q1", "Q2", "Q3", "Q4"],
+                            index=0,
+                            key="quarter",
+                        )
+                st.text_input(
+                    "Ask a question about the document",
+                    key="user_input",
+                    on_change=send_message,
                 )
         else:
-            st.write(message["content"])
+            st.markdown("### Create or select a chat to continue")
+            st.markdown(
+                "👈 Use the left panel to create a new chat or select an existing one"
+            )
 
-# Show which agents are currently active
-active_agent_names = [
-    name for name, is_active in st.session_state.active_agents.items() if is_active
-]
-if active_agent_names:
-    st.info(f"Active agents: {', '.join(active_agent_names)}")
-else:
-    st.warning("No agents selected. Please enable at least one agent in the sidebar.")
-
-
-# Chat input - only enable if at least one agent is active
-if len(active_agent_names) > 0:
-    if prompt := st.chat_input("Ask a question about NVIDIA..."):
-        # Add user message to chat history
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
-        # Display user message
-        with st.chat_message("user"):
-            st.write(prompt)
-
-        # Display assistant response with a spinner while processing
-        with st.chat_message("assistant"):
-            with st.spinner(
-                f"Generating research document using {', '.join(active_agent_names)} agents..."
-            ):
-                # Call the FastAPI endpoint to generate the research document
-                try:
-                    response = requests.post(
-                        f"{FASTAPI_URL}/chat",
-                        params={
-                            "message": prompt,
-                            "snowflake_agent": st.session_state.active_agents[
-                                "snowflake_agent"
-                            ],
-                            "pinecone_agent": st.session_state.active_agents[
-                                "rag_agent"
-                            ],
-                            "websearch_agent": st.session_state.active_agents[
-                                "web_search_agent"
-                            ],
-                            "year": (
-                                None
-                                if st.session_state.year == "None"
-                                else int(st.session_state.year)
-                            ),
-                            "quarter": (
-                                None
-                                if st.session_state.quarter == "None"
-                                else int(st.session_state.quarter)
-                            ),
-                        },
-                        timeout=120,  # Increased timeout for complex queries
-                    )
-
-                    if response.status_code == 200:
-                        print("Response: ", response.json())
-                        research_document = response.json().get("report", "")
-
-                        # visualizations = response.json().get("visualizations", [])
-
-                        # Store the research document in session state
-                        st.session_state.research_document = research_document
-
-                        # Display the markdown content
-                        st.markdown(research_document)
-
-                        # Display visualization if available
-                        # st.title("Visualizations")
-                        # for viz, viz_summary in visualizations:
-                        #     try:
-                        #         st.subheader(viz_summary)
-                        #         exec(viz)
-                        #     except Exception as e:
-                        #         continue
-
-                        # Add download button for the research document
-                        st.markdown(
-                            get_download_link(
-                                research_document, "Research_Document.md"
-                            ),
-                            unsafe_allow_html=True,
-                        )
-
-                        # Add assistant response to chat history with visualization if available
-                        message_data = {
-                            "role": "assistant",
-                            "content": research_document,
-                            "is_markdown": True,
-                        }
-
-                        st.session_state.messages.append(message_data)
-                    else:
-                        st.error(f"Error: {response.status_code} - {response.text}")
-                        st.session_state.messages.append(
-                            {
-                                "role": "assistant",
-                                "content": f"Error: Unable to generate research document. Status code: {response.status_code}",
-                                "is_markdown": False,
-                            }
-                        )
-                except Exception as e:
-                    st.error(f"Error connecting to API: {str(e)}")
-                    st.session_state.messages.append(
-                        {
-                            "role": "assistant",
-                            "content": f"Error: Unable to connect to the research API. {str(e)}",
-                            "is_markdown": False,
-                        }
-                    )
-else:
-    st.chat_input("Please select at least one agent to continue...", disabled=True)
-
-# Display download button for the latest research document if it exists
-if st.session_state.research_document:
-    st.sidebar.markdown("### Download Latest Research")
-    st.sidebar.markdown(
-        get_download_link(st.session_state.research_document, "Research_Document.md"),
-        unsafe_allow_html=True,
-    )
-
-
-#     user_input = st.chat_input("Ask the agent a question...")
-
-#     if user_input:
-#         st.session_state.chat_history.append({"role": "user", "content": user_input})
-#         with st.spinner("Thinking..."):
-#             response = requests.post(f"{FASTAPI_URL}/chat", json={
-#                 "query": user_input,
-#                 "chat_history": st.session_state.chat_history
-#             })
-#             data = response.json()
-#             agent_reply = data.get("response", "No response from agent.")
-#             st.session_state.chat_history.append({"role": "agent", "content": agent_reply})
-
-
-#     st.subheader("📥 Download Latest Report")
-#     if st.button("Download Markdown Report"):
-#         download_response = requests.get(f"{FASTAPI_URL}/download-report")
-#         if download_response.status_code == 200:
-#             st.download_button(
-#                 label="📄 Download Markdown File",
-#                 data=download_response.content,
-#                 file_name="nvidia_report.md",
-#                 mime="text/markdown"
-#             )
-#         else:
-#             st.error("Failed to download report.")
-
-# Tabs for different tools
-# tab1, tab2, tab3 = st.tabs(["🔍 Search Pinecone", "🌐 Web Search", "💬 Chat Agent"])
-
-# # --- Search Pinecone Tool ---
-# with tab1:
-#     st.header("🔍 Pinecone Document Search")
-#     query = st.text_input("Enter your query")
-#     year = st.text_input("Year (optional)")
-#     quarter = st.text_input("Quarter (optional)")
-#     top_k = st.slider("Top K Results", 1, 10, 5)
-
-#     if st.button("Search Pinecone"):
-#         response = requests.post(f"{FASTAPI_URL}/run-tool", json={
-#             "tool": "search_pinecone",
-#             "query": query,
-#             "year": year,
-#             "quarter": quarter,
-#             "top_k": top_k
-#         })
-#         result = response.json()
-#         st.subheader("Results")
-#         st.text(result.get("result", "No result returned"))
-
-# # --- Web Search Tool ---
-# with tab2:
-#     st.header("🌐 Web Search Tool")
-#     web_query = st.text_input("Enter your web search query")
-#     if st.button("Search Web"):
-#         response = requests.post(f"{FASTAPI_URL}/run-tool", json={
-#             "tool": "web_search",
-#             "query": web_query
-#         })
-#         result = response.json()
-#         st.subheader("Web Results")
-#         st.text(result.get("result", "No result returned"))
-
-# # --- Chat Interface ---
-# with tab3:
-#     st.header("💬 Chat with the Research Agent")
-
-#     if "chat_history" not in st.session_state:
-#         st.session_state.chat_history = []
-
-#     user_input = st.chat_input("Ask the agent a question...")
-
-#     if user_input:
-#         st.session_state.chat_history.append({"role": "user", "content": user_input})
-#         with st.spinner("Thinking..."):
-#             response = requests.post(f"{FASTAPI_URL}/chat", json={
-#                 "query": user_input,
-#                 "chat_history": st.session_state.chat_history
-#             })
-#             data = response.json()
-#             agent_reply = data.get("response", "No response from agent.")
-#             st.session_state.chat_history.append({"role": "agent", "content": agent_reply})
-
-#     for msg in st.session_state.chat_history:
-#         if msg["role"] == "user":
-#             st.chat_message("user").write(msg["content"])
-#         else:
-#             st.chat_message("assistant").write(msg["content"])
-
-#     st.subheader("📥 Download Latest Report")
-#     if st.button("Download Markdown Report"):
-#         download_response = requests.get(f"{FASTAPI_URL}/download-report")
-#         if download_response.status_code == 200:
-#             st.download_button(
-#                 label="📄 Download Markdown File",
-#                 data=download_response.content,
-#                 file_name="nvidia_report.md",
-#                 mime="text/markdown"
-#             )
-#         else:
-#             st.error("Failed to download report.")
+with right_col:
+    st.header("Usage Metrics")
+    with st.expander("📊 Summary Token Usage & Cost", expanded=True):
+        st.metric("Input Tokens", ss.get("input_tokens", "N/A"))
+        st.metric("Output Tokens", ss.get("output_tokens", "N/A"))
+        st.metric("Cost ($)", f"${ss.get('cost', 0):.4f}")
